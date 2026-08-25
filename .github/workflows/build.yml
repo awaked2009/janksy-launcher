@@ -1,9 +1,9 @@
 name: Build Launcher
 
 on:
-    workflow_dispatch:
-    release:
-        types: [published]
+  workflow_dispatch:
+  release:
+    types: [published]
 
 jobs:
   build:
@@ -36,8 +36,15 @@ jobs:
         run: |
           pyinstaller --onefile --noconsole --name "JanksyLauncher" janksy.py
 
+      - name: Rename build artifact
+        shell: bash
+        run: |
+          mv dist/${{ matrix.artifact_name }} dist/${{ matrix.asset_name }}
+
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/${{ matrix.artifact_name }}
+          tag_name: ${{ github.event.release.tag_name }}
+          files: dist/${{ matrix.asset_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
