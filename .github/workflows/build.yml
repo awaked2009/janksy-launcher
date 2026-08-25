@@ -33,7 +33,7 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller --onefile --noconsole --name "JanksyLauncher" launcher.py
+          pyinstaller --onefile --noconsole --name "JanksyLauncher" janksy.py
 
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
