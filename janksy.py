@@ -66,7 +66,7 @@ MICROSOFT_REDIRECT_URI = "http://127.0.0.1:8765"
 DISCORD_CLIENT_ID = "1100000000000000000"
 
 APP_NAME = "Janksy Launcher"
-APP_VERSION = "1.0.0 "
+APP_VERSION = "1.0.1 "
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("APPDATA", APP_DIR)) / "JanksyLauncher"
@@ -1051,7 +1051,7 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         ).pack()
         ctk.CTkLabel(
             logo_frame,
-            text="GLASS  EDITION",
+            text=APP_VERSION,
             text_color=MUTED,
             font=ctk.CTkFont(size=9, weight="bold"),
         ).pack(pady=(3, 0))
