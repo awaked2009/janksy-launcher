@@ -1,0 +1,71 @@
+('F:\\VSCode\\Microsoft VS Code\\janksy '
+ 'launcher\\build\\JanksyLauncher\\JanksyLauncher.pkg',
+ {'BINARY': True,
+  'DATA': True,
+  'EXECUTABLE': True,
+  'EXTENSION': True,
+  'PYMODULE': True,
+  'PYSOURCE': True,
+  'PYZ': False,
+  'SPLASH': True,
+  'SYMLINK': False},
+ [('pyi-contents-directory _internal', '', 'OPTION'),
+  ('PYZ-00.pyz',
+   'F:\\VSCode\\Microsoft VS Code\\janksy '
+   'launcher\\build\\JanksyLauncher\\PYZ-00.pyz',
+   'PYZ'),
+  ('struct',
+   'F:\\VSCode\\Microsoft VS Code\\janksy '
+   'launcher\\build\\JanksyLauncher\\localpycs\\struct.pyc',
+   'PYMODULE'),
+  ('pyimod01_archive',
+   'F:\\VSCode\\Microsoft VS Code\\janksy '
+   'launcher\\build\\JanksyLauncher\\localpycs\\pyimod01_archive.pyc',
+   'PYMODULE'),
+  ('pyimod02_importers',
+   'F:\\VSCode\\Microsoft VS Code\\janksy '
+   'launcher\\build\\JanksyLauncher\\localpycs\\pyimod02_importers.pyc',
+   'PYMODULE'),
+  ('pyimod03_ctypes',
+   'F:\\VSCode\\Microsoft VS Code\\janksy '
+   'launcher\\build\\JanksyLauncher\\localpycs\\pyimod03_ctypes.pyc',
+   'PYMODULE'),
+  ('pyimod04_pywin32',
+   'F:\\VSCode\\Microsoft VS Code\\janksy '
+   'launcher\\build\\JanksyLauncher\\localpycs\\pyimod04_pywin32.pyc',
+   'PYMODULE'),
+  ('pyiboot01_bootstrap',
+   'F:\\VSCode\\Microsoft VS Code\\janksy '
+   'launcher\\venv\\Lib\\site-packages\\PyInstaller\\loader\\pyiboot01_bootstrap.py',
+   'PYSOURCE'),
+  ('pyi_rth_inspect',
+   'F:\\VSCode\\Microsoft VS Code\\janksy '
+   'launcher\\venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_inspect.py',
+   'PYSOURCE'),
+  ('pyi_rth_setuptools',
+   'F:\\VSCode\\Microsoft VS Code\\janksy '
+   'launcher\\venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_setuptools.py',
+   'PYSOURCE'),
+  ('pyi_rth_pkgutil',
+   'F:\\VSCode\\Microsoft VS Code\\janksy '
+   'launcher\\venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_pkgutil.py',
+   'PYSOURCE'),
+  ('pyi_rth_multiprocessing',
+   'F:\\VSCode\\Microsoft VS Code\\janksy '
+   'launcher\\venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_multiprocessing.py',
+   'PYSOURCE'),
+  ('pyi_rth__tkinter',
+   'F:\\VSCode\\Microsoft VS Code\\janksy '
+   'launcher\\venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth__tkinter.py',
+   'PYSOURCE'),
+  ('janksy',
+   'F:\\VSCode\\Microsoft VS Code\\janksy launcher\\janksy.py',
+   'PYSOURCE')],
+ 'python314.dll',
+ True,
+ False,
+ False,
+ [],
+ None,
+ None,
+ None)
