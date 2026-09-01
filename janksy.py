@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -27,6 +28,7 @@ import threading
 import time
 import urllib.request
 import webbrowser
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +58,15 @@ except ImportError:
     minecraft_launcher_lib = None
     microsoft_account = None
 
+# Windows registry access (used for Java detection; unavailable elsewhere).
+if sys.platform == "win32":
+    try:
+        import winreg
+    except ImportError:
+        winreg = None
+else:
+    winreg = None
+
 
 # ============================================================================
 # RELEASE CONFIGURATION
@@ -66,12 +77,15 @@ MICROSOFT_REDIRECT_URI = "http://127.0.0.1:8765"
 DISCORD_CLIENT_ID = "1100000000000000000"
 
 APP_NAME = "Janksy Launcher"
-APP_VERSION = "1.0.1 "
+APP_VERSION = "1.0.7"
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("APPDATA", APP_DIR)) / "JanksyLauncher"
 ACCOUNTS_FILE = DATA_DIR / "accounts.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
+VERSION_CACHE_FILE = DATA_DIR / "version_cache.json"
+RUNTIME_DIR = DATA_DIR / "runtime"
+VERSION_CACHE_TTL = 6 * 3600  # seconds before online version lists are re-fetched
 
 # Apply launcher library argument patch once to avoid recursive monkey-patching
 if minecraft_launcher_lib and hasattr(minecraft_launcher_lib.command, "get_arguments"):
@@ -331,46 +345,236 @@ def save_json(path: Path, value):
         log("JSON save failed:", path, exc)
 
 
+def _java_feature_from_path(candidate: Path) -> int:
+    """Best-effort Java feature version (8, 17, 21, ...) parsed from a path."""
+    s = str(candidate).lower()
+    for key in ("jdk", "jre", "java", "corretto", "zulu", "semeru", "temurin"):
+        m = re.search(key + r"[-_.]?(\d{1,3})", s)
+        if m:
+            v = int(m.group(1))
+            if 1 < v < 99:
+                return v
+    if re.search(r"1[._]8", s):
+        return 8
+    return 0
+
+
 def find_java() -> str:
-    """Fast Java detection. Never recursively scans entire drives."""
-    candidates = []
+    """Fast Windows-first Java detection. Never recursively scans entire
+    drives. Prefers launcher-managed runtimes, then system installs, then the
+    runtimes bundled with the official Minecraft launcher."""
+    candidates: list[tuple[tuple[int, int], Path]] = []
 
-    java_home = os.environ.get("JAVA_HOME")
-    if java_home:
-        root = Path(java_home)
-        candidates += [
-            root / "bin" / "java.exe",
-            root / "bin" / "java",
-        ]
-
-    java_path = shutil.which("java")
-    if java_path:
-        candidates.append(Path(java_path))
-
-    if sys.platform == "win32":
-        roots = [
-            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Java",
-            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Eclipse Adoptium",
-            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Microsoft",
-            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Eclipse Adoptium",
-        ]
-
-        for root in roots:
-            if root.exists():
-                try:
-                    for child in root.iterdir():
-                        candidates.append(child / "bin" / "java.exe")
-                except OSError:
-                    pass
-
-    for candidate in candidates:
+    def add(path: Path, priority: int):
         try:
-            if candidate.is_file():
-                return str(candidate)
+            if path.is_file():
+                candidates.append(((priority, _java_feature_from_path(path)), path))
         except OSError:
             pass
 
-    return ""
+    # 1) Runtimes downloaded by this launcher itself.
+    if RUNTIME_DIR.is_dir():
+        try:
+            for exe in RUNTIME_DIR.glob("*/bin/java*"):
+                add(exe, 3)
+            for exe in RUNTIME_DIR.glob("*/*/bin/java*"):
+                add(exe, 3)
+        except OSError:
+            pass
+
+    # 2) JAVA_HOME + PATH.
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        root = Path(java_home)
+        add(root / "bin" / "java.exe", 2)
+        add(root / "bin" / "java", 2)
+    java_on_path = shutil.which("java")
+    if java_on_path:
+        add(Path(java_on_path), 2)
+
+    # 3) Windows registry (JDK/JRE installs register their home there).
+    if winreg is not None:
+        reg_keys = [
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Eclipse Adoptium\JDK"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Eclipse Adoptium\JRE"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\JavaSoft\JDK"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\JavaSoft\Java Runtime Environment"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\JavaSoft\Java Runtime Environment"),
+        ]
+        for hive, subkey in reg_keys:
+            try:
+                with winreg.OpenKey(hive, subkey) as root_key:
+                    index = 0
+                    while True:
+                        try:
+                            _ver_name = winreg.EnumKey(root_key, index)
+                        except OSError:
+                            break
+                        index += 1
+                        try:
+                            with winreg.OpenKey(root_key, _ver_name) as ver_key:
+                                home = str(winreg.QueryValueEx(ver_key, "JavaHome")[0])
+                        except OSError:
+                            continue
+                        add(Path(home) / "bin" / "java.exe", 2)
+            except OSError:
+                pass
+
+    # 4) Common vendor folders (one level deep only — keeps it fast).
+    if sys.platform == "win32":
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        lad = os.environ.get("LOCALAPPDATA", "")
+        roots = [
+            Path(pf) / "Java",
+            Path(pf) / "Eclipse Adoptium",
+            Path(pf) / "Amazon Corretto",
+            Path(pf) / "Zulu",
+            Path(pf) / "Microsoft",
+            Path(pf) / "BellSoft",
+            Path(pf) / "Semeru",
+            Path(pf) / "ojdkbuild",
+            Path(pf86) / "Java",
+            Path(pf86) / "Eclipse Adoptium",
+        ]
+        if lad:
+            roots.append(Path(lad) / "Programs" / "Eclipse Adoptium")
+            roots.append(Path(lad) / "Programs" / "Java")
+        for root in roots:
+            if not root.is_dir():
+                continue
+            try:
+                for child in root.iterdir():
+                    add(child / "bin" / "java.exe", 1)
+            except OSError:
+                pass
+
+        # 5) Runtimes installed by the official Minecraft launcher.
+        mojang_base = (
+            Path(os.getenv("LOCALAPPDATA", "")) / "Packages"
+            / "Microsoft.4297127D64EC6_8wekyb3d8bbwe" / "LocalCache" / "Local" / "runtime"
+        )
+        if mojang_base.is_dir():
+            try:
+                for exe in mojang_base.glob("*/*/*/bin/java.exe"):
+                    add(exe, 0)
+            except OSError:
+                pass
+
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    return str(candidates[0][1])
+# ----------------------------------------------------------------------------
+# AUTO JAVA DOWNLOAD (Adoptium Temurin JRE)
+# ----------------------------------------------------------------------------
+_JAVA_DL_LOCK = threading.Lock()
+ADOPTIUM_INSTALLER_URL = (
+    "https://api.adoptium.net/v3/installer/latest/{feature}/ga/"
+    "{osname}/{arch}/jre/hotspot/normal/eclipse?project=jdk"
+)
+ADOPTIUM_ASSETS_URL = (
+    "https://api.adoptium.net/v3/assets/latest/{feature}/hotspot"
+    "?os={osname}&architecture={arch}&image_type=jre&project=jdk"
+)
+
+
+def _download_file(url: str, dest: Path, progress_cb=None):
+    """Streams a URL to disk, calling progress_cb(0-100) ~4x per second."""
+    req = urllib.request.Request(url, headers={"User-Agent": "JanksyLauncher/1.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp, dest.open("wb") as out:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        last_report = 0.0
+        while True:
+            chunk = resp.read(512 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+            done += len(chunk)
+            if progress_cb and total:
+                pct = min(100.0, done / total * 100.0)
+                now = time.time()
+                if now - last_report > 0.25 or pct >= 100.0:
+                    progress_cb(pct)
+                    last_report = now
+
+
+def _resolve_adoptium_link(feature: int, osname: str, arch: str) -> str:
+    """Fallback: ask the Adoptium assets API for the JRE package link."""
+    url = ADOPTIUM_ASSETS_URL.format(feature=feature, osname=osname, arch=arch)
+    with urllib.request.urlopen(
+        urllib.request.Request(url, headers={"User-Agent": "JanksyLauncher/1.0"}), timeout=30
+    ) as resp:
+        assets = json.load(resp)
+    best = None
+    for asset in assets or []:
+        package = ((asset or {}).get("binary") or {}).get("package") or {}
+        link = package.get("link")
+        if link and (best is None or (package.get("size") or 0) > best[1]):
+            best = (link, package.get("size") or 0)
+    if not best:
+        raise Exception("Adoptium did not return a download link.")
+    return best[0]
+
+
+def download_java_runtime(feature: int = 21, progress_cb=None) -> str:
+    """Downloads a Temurin JRE into the launcher's managed runtime folder and
+    returns the path to its java executable. Idempotent and thread-safe."""
+    if sys.platform != "win32":
+        raise Exception("Automatic Java download is currently Windows-only.")
+    osname, arch, exe_name = "windows", "x64", "java.exe"
+
+    with _JAVA_DL_LOCK:
+        rt_root = RUNTIME_DIR / f"jre-{feature}"
+        exe = rt_root / "bin" / exe_name
+        if exe.is_file():
+            return str(exe)
+
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        zip_path = RUNTIME_DIR / f"temurin-jre-{feature}.zip"
+
+        url = ADOPTIUM_INSTALLER_URL.format(feature=feature, osname=osname, arch=arch)
+        try:
+            _download_file(url, zip_path, progress_cb)
+        except Exception as exc:
+            log(f"Adoptium installer endpoint failed ({exc}); trying assets API...")
+            fallback = _resolve_adoptium_link(feature, osname, arch)
+            _download_file(fallback, zip_path, progress_cb)
+
+        extract_dir = RUNTIME_DIR / f"_extract-{feature}"
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir, ignore_errors=True)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(extract_dir)
+
+        src = None
+        for bin_dir in extract_dir.rglob("bin"):
+            if (bin_dir / exe_name).is_file():
+                src = bin_dir.parent
+                break
+        if src is None:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            raise Exception("Downloaded Java archive had an unexpected layout.")
+
+        if rt_root.exists():
+            shutil.rmtree(rt_root, ignore_errors=True)
+        shutil.move(str(src), str(rt_root))
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        try:
+            zip_path.unlink()
+        except OSError:
+            pass
+
+        if not exe.is_file():
+            raise Exception("Java extraction failed.")
+        log("Downloaded Java", feature, "to", rt_root)
+        return str(exe)
+
+
+# ============================================================================
+# DISCORD RPC CONTROLLER
+# ============================================================================
 
 
 # ============================================================================
@@ -414,212 +618,6 @@ class DiscordRPCController:
             except Exception:
                 pass
 
-# ============================================================================
-# MOD LOADER INSTALLER DIALOG (SEARCHABLE LIST UI)
-# ============================================================================
-class InstallModDialog(ctk.CTkToplevel):
-    def __init__(self, parent, mc_dir, accent_color, on_complete_callback=None):
-        super().__init__(parent)
-        self.title("Install Mod Loader")
-        self.geometry("420x540")
-        self.resizable(False, False)
-        self.transient(parent)
-        self.grab_set()
-
-        self.mc_dir = mc_dir
-        self.accent = accent_color
-        self.on_complete = on_complete_callback
-        
-        self.selected_version = None
-        self.version_buttons = {}
-        self.all_versions = []
-
-        self.configure(fg_color=BG_DARK)
-
-        self.update_idletasks()
-        parent_x = parent.winfo_x()
-        parent_y = parent.winfo_y()
-        parent_w = parent.winfo_width()
-        parent_h = parent.winfo_height()
-        x = parent_x + (parent_w - 420) // 2
-        y = parent_y + (parent_h - 540) // 2
-        self.geometry(f"420x540+{max(0, x)}+{max(0, y)}")
-
-        frame = ctk.CTkFrame(self, fg_color=CARD, corner_radius=16, border_width=1, border_color=OUTLINE)
-        frame.pack(fill="both", expand=True, padx=15, pady=15)
-
-        ctk.CTkLabel(frame, text="Select Mod Loader", text_color=TEXT, font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=15, pady=(15, 6))
-        self.loader_var = ctk.StringVar(value="Fabric")
-        self.loader_seg = ctk.CTkSegmentedButton(
-            frame,
-            values=["Fabric", "Forge", "Quilt"],
-            variable=self.loader_var,
-            selected_color=self.accent,
-            selected_hover_color=self.accent,
-            font=ctk.CTkFont(size=12, weight="bold"),
-            height=32
-        )
-        self.loader_seg.pack(fill="x", padx=15, pady=(0, 12))
-
-        ctk.CTkLabel(frame, text="Select Minecraft Version", text_color=TEXT, font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=15, pady=(4, 6))
-        
-        self.search_var = ctk.StringVar()
-        self.search_var.trace_add("write", self._filter_versions)
-        self.search_entry = ctk.CTkEntry(
-            frame,
-            placeholder_text="🔍  Search version (e.g. 1.21)...",
-            textvariable=self.search_var,
-            height=36,
-            fg_color=CARD_2,
-            border_color=OUTLINE,
-            corner_radius=10
-        )
-        self.search_entry.pack(fill="x", padx=15, pady=(0, 8))
-
-        self.scroll_frame = ctk.CTkScrollableFrame(
-            frame,
-            height=210,
-            fg_color=BG_DARK,
-            border_width=1,
-            border_color=OUTLINE,
-            corner_radius=10
-        )
-        self.scroll_frame.pack(fill="both", expand=True, padx=15, pady=(0, 10))
-
-        self.status_lbl = ctk.CTkLabel(frame, text="Fetching version list from Mojang...", text_color=MUTED, font=ctk.CTkFont(size=11))
-        self.status_lbl.pack(pady=(0, 4))
-
-        self.install_btn = ctk.CTkButton(
-            frame,
-            text="Install Loader",
-            height=40,
-            corner_radius=10,
-            fg_color=self.accent,
-            hover_color=self.accent,
-            font=ctk.CTkFont(size=13, weight="bold"),
-            command=self.start_install,
-            state="disabled"
-        )
-        self.install_btn.pack(fill="x", padx=15, pady=(0, 15))
-
-        threading.Thread(target=self._fetch_versions, daemon=True).start()
-
-    def _fetch_versions(self):
-        try:
-            import minecraft_launcher_lib as mll
-            version_data = mll.utils.get_version_list()
-            releases = [v["id"] for v in version_data if v.get("type") == "release"]
-            if releases:
-                self.after(0, lambda: self._build_version_list(releases))
-                return
-        except Exception:
-            pass
-
-        fallback = ["1.21.4", "1.21.3", "1.21.1", "1.20.6", "1.20.4", "1.20.1", "1.19.4", "1.18.2", "1.16.5"]
-        self.after(0, lambda: self._build_version_list(fallback))
-
-    def _build_version_list(self, versions):
-        self.all_versions = versions
-        self.version_buttons.clear()
-
-        for widget in self.scroll_frame.winfo_children():
-            widget.destroy()
-
-        for ver in versions:
-            btn = ctk.CTkButton(
-                self.scroll_frame,
-                text=f"Minecraft  {ver}",
-                anchor="w",
-                height=34,
-                corner_radius=8,
-                fg_color=CARD_2,
-                hover_color=OUTLINE,
-                text_color=TEXT,
-                font=ctk.CTkFont(size=12, weight="bold"),
-                command=lambda v=ver: self._select_version(v)
-            )
-            btn.pack(fill="x", pady=2, padx=2)
-            self.version_buttons[ver] = btn
-
-        self.status_lbl.configure(text="Select a version to install.")
-        if versions:
-            self._select_version(versions[0])
-
-    def _filter_versions(self, *args):
-        query = self.search_var.get().lower().strip()
-        visible_count = 0
-
-        for ver, btn in self.version_buttons.items():
-            if not query or query in ver.lower():
-                btn.pack(fill="x", pady=2, padx=2)
-                visible_count += 1
-            else:
-                btn.pack_forget()
-
-        if visible_count == 0:
-            self.status_lbl.configure(text="No matching versions found.", text_color=ERROR)
-        elif self.selected_version:
-            self.status_lbl.configure(text=f"Selected: {self.loader_var.get()} for {self.selected_version}", text_color=MUTED)
-
-    def _select_version(self, version):
-        self.selected_version = version
-
-        for ver, btn in self.version_buttons.items():
-            if ver == version:
-                btn.configure(fg_color=self.accent, hover_color=self.accent, text_color="white")
-            else:
-                btn.configure(fg_color=CARD_2, hover_color=OUTLINE, text_color=TEXT)
-
-        self.install_btn.configure(state="normal", text=f"Install {self.loader_var.get()} {version}")
-        self.status_lbl.configure(text=f"Ready to install {self.loader_var.get()} {version}", text_color=MUTED)
-
-    def start_install(self):
-        loader = self.loader_var.get().lower()
-        version = self.selected_version
-
-        if not version:
-            return
-
-        self.install_btn.configure(state="disabled")
-        self.loader_seg.configure(state="disabled")
-        self.search_entry.configure(state="disabled")
-        self.status_lbl.configure(text=f"Downloading & installing {loader.capitalize()} {version}...", text_color=self.accent)
-
-        threading.Thread(target=self._worker, args=(loader, version), daemon=True).start()
-
-    def _worker(self, loader, version):
-        try:
-            import minecraft_launcher_lib as mll
-
-            if loader == "fabric":
-                mll.fabric.install_fabric(version, self.mc_dir)
-            elif loader == "quilt":
-                mll.quilt.install_quilt(version, self.mc_dir)
-            elif loader == "forge":
-                forge_ver = mll.forge.find_forge_version(version)
-                if forge_ver:
-                    mll.forge.install_forge_version(forge_ver, self.mc_dir)
-                else:
-                    raise Exception(f"No Forge release found for {version}")
-
-            self.after(0, lambda: self._on_success(f"{loader.capitalize()} {version} Installed!"))
-        except Exception as exc:
-            self.after(0, lambda: self._on_failure(str(exc)))
-
-    def _on_success(self, msg):
-        self.status_lbl.configure(text=msg, text_color=SUCCESS)
-        if self.on_complete:
-            self.on_complete()
-        self.after(1200, self.destroy)
-
-    def _on_failure(self, err_text):
-        self.status_lbl.configure(text=f"Error: {err_text}", text_color=ERROR)
-        self.install_btn.configure(state="normal")
-        self.loader_seg.configure(state="normal")
-        self.search_entry.configure(state="normal")
-
-
-# ============================================================================
 # GAME LOG / TERMINAL WINDOW
 # ============================================================================
 class GameLogWindow(ctk.CTkToplevel):
@@ -770,14 +768,17 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
                 "theme": "Midnight Glass",
                 "minecraft_directory": "",
                 "java_path": "",
+                "java_automanage": True,
                 "ram": 6,
                 "jvm_args": "",
                 "width": 1920,
                 "height": 1080,
+                "fullscreen": False,
                 "behavior": "Keep Open",
                 "discord_rpc": False,
                 "background": "",
                 "background_alpha": 1.0,
+                "last_version": "",
             },
         )
 
@@ -800,6 +801,29 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         self._filtered_versions: list[dict[str, Any]] = []
         self._version_meta: dict[str, dict[str, Any]] = {}
         self._loader_catalog_loaded = False
+        self._version_cache_loaded = False
+        self._vanilla_versions: list[dict[str, Any]] = []
+        self._loader_entries: list[dict[str, Any]] = []
+        self._cache_fetched_at = 0.0
+
+        # --- performance state ---
+        # Tabs are built once and cached (show/hide) instead of being torn
+        # down and rebuilt on every switch.
+        self._tab_frames: dict[str, ctk.CTkFrame] = {}
+        # Version rows render in small chunks so the Play tab never freezes,
+        # and only restyle in-place when the selection changes.
+        self._version_rows: dict[str, dict[str, Any]] = {}
+        self._rendered_count = 0
+        self._draw_generation = 0
+        self._version_footer_lbl = None
+        self._f_ver_name = ctk.CTkFont(size=13, weight="bold")
+        self._f_ver_type = ctk.CTkFont(size=9, weight="bold")
+        self._f_ver_btn = ctk.CTkFont(size=11, weight="bold")
+        # Background image render cache (decoded source + generation token).
+        self._bg_src_img = None
+        self._bg_src_path = ""
+        self._bg_render_token = 0
+        self._bg_render_size = (0, 0)
 
         self.selected_version = None
         self.selected_account_index = 0
@@ -865,13 +889,24 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
 
             Path(self.minecraft_directory).mkdir(parents=True, exist_ok=True)
 
-            self.set_status("Detecting Java...")
-            if not self.java_path:
-                self.java_path = find_java()
-                self.settings["java_path"] = self.java_path
-                save_json(SETTINGS_FILE, self.settings)
+            # Detect (and, if needed, auto-download) Java in its own thread so
+            # a first-time Java download never blocks the UI or version load.
+            if self.java_path and Path(self.java_path).is_file():
+                self.ui(self._sync_java_entry)
+            else:
+                threading.Thread(
+                    target=self._auto_java_worker,
+                    kwargs={"set_progress": lambda p: self.set_status(f"Downloading Java... {int(p)}%")},
+                    name="JanksyJavaSetup",
+                    daemon=True,
+                ).start()
 
             self.set_status("Loading Minecraft versions...")
+            # Restore the last played version so it is already selected when
+            # the list appears.
+            last = str(self.settings.get("last_version") or "")
+            if last:
+                self.selected_version = last
             self.load_version_data()
 
             self.set_status("Ready")
@@ -887,15 +922,122 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         self.ui(self._post_startup_refresh)
 
     def _post_startup_refresh(self):
-        if hasattr(self, "java_entry"):
-            self.java_entry.delete(0, "end")
-            self.java_entry.insert(0, self.java_path)
+        self._sync_java_entry()
 
         if hasattr(self, "directory_entry"):
             self.directory_entry.delete(0, "end")
             self.directory_entry.insert(0, self.minecraft_directory)
 
         self.refresh_accounts()
+
+        # Surface the restored last-version selection.
+        last = self.selected_version
+        if last:
+            note = ""
+            known = any(v["id"] == last for v in self.versions)
+            installed = any(v["id"] == last and v.get("installed") for v in self.versions)
+            if known and not installed:
+                note = " (not installed — uncheck 'Installed' to see it)"
+            elif not known:
+                note = " (will install on launch)"
+            self.set_status(f"Selected: {last}{note}")
+        self._update_selected_version_display()
+
+    # ------------------------------------------------------------------
+    # Java auto-detection / auto-download plumbing
+    # ------------------------------------------------------------------
+    def _sync_java_entry(self):
+        """Pushes the resolved Java path into the Play page entry + Settings
+        status label. Safe to call from any thread via self.ui()."""
+        if self.closing:
+            return
+        if hasattr(self, "java_entry"):
+            try:
+                self.java_entry.delete(0, "end")
+                if self.java_path:
+                    self.java_entry.insert(0, self.java_path)
+            except Exception:
+                pass
+        self._refresh_java_status()
+
+    def _java_status_text(self):
+        p = self.java_path
+        if p and Path(p).is_file():
+            return f"✓ Java detected:\n{p}"
+        if p:
+            return f"⚠ Java path set but the file is missing:\n{p}"
+        return ("✗ No Java found on this PC.\n"
+                "With auto-manage ON the launcher downloads one automatically, "
+                "or click 'Download Java 21'.")
+
+    def _refresh_java_status(self):
+        lbl = getattr(self, "java_status_lbl", None)
+        if lbl is not None:
+            try:
+                lbl.configure(text=self._java_status_text())
+            except Exception:
+                pass
+
+    def _set_java_progress(self, text, color=MUTED):
+        lbl = getattr(self, "java_progress_lbl", None)
+        if lbl is None:
+            return
+        try:
+            lbl.configure(text=text, text_color=color)
+        except Exception:
+            pass
+
+    def _auto_java_worker(self, set_progress=None) -> str:
+        """Thread worker: detect Java; auto-download Temurin 21 when
+        auto-manage is enabled and nothing is installed. Returns path or ''."""
+        java = self.java_path
+        if java and Path(java).is_file():
+            return java
+
+        java = find_java()
+        if java:
+            self.java_path = java
+            self.settings["java_path"] = java
+            save_json(SETTINGS_FILE, self.settings)
+            self.ui(self._sync_java_entry)
+            return java
+
+        if not self.settings.get("java_automanage", True):
+            return ""
+
+        def report(pct):
+            if set_progress:
+                set_progress(pct)
+            self.ui(lambda p=pct: self.set_status(f"Downloading Java 21... {int(p)}%"))
+
+        try:
+            java = download_java_runtime(21, progress_cb=report)
+        except Exception as exc:
+            log("Java auto-download failed:", exc)
+            self.ui(lambda: self.set_status(f"Java download failed: {exc}"))
+            return ""
+
+        self.java_path = java
+        self.settings["java_path"] = java
+        save_json(SETTINGS_FILE, self.settings)
+        self.ui(self._sync_java_entry)
+        self.ui(self.set_status, "Java 21 installed.")
+        return java
+
+    def _ensure_java_available(self, set_status=None) -> str:
+        """Returns a usable Java path for loader installs, auto-downloading
+        one when auto-manage is enabled. Raises a friendly error otherwise."""
+        java = self.java_path
+        if java and Path(java).is_file():
+            return java
+        progress = (lambda p: set_status(f"Downloading Java 21... {int(p)}%")) if set_status else None
+        java = self._auto_java_worker(set_progress=progress)
+        if java:
+            return java
+        raise Exception(
+            "Java is required to install this mod loader and none was found.\n"
+            "Enable 'Auto-manage Java' in Settings → Java Runtime, or install Java 21+ manually."
+        )
 
     def detect_minecraft_directory(self):
         if minecraft_launcher_lib:
@@ -937,7 +1079,7 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         )
         self.content.pack(side="left", fill="both", expand=True, padx=(0, 22), pady=22)
 
-        self.show_play()
+        self.switch_tab(self.current_tab)
         self._apply_shell_corners()
 
     def _shell_bg(self):
@@ -978,6 +1120,47 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
                 )
             except Exception:
                 pass
+        self._apply_glass_to_tabs()
+
+    def _apply_glass_to_tabs(self):
+        """Transparent CTk widgets snapshot their parent's color once at
+        creation. After the glass tint changes (or is removed), cached tabs
+        must re-detect it or they keep a stale dark patch (the visible 'hard
+        edge' inside the content card)."""
+        for frame in list(self._tab_frames.values()):
+            self._refresh_transparent_colors(frame)
+
+    def _refresh_transparent_colors(self, widget):
+        """Recursively re-detects the parent color of every transparent child
+        widget after the glass tint changes. CustomTkinter snapshots the
+        parent color at creation, so stale dark patches (the 'hard edge'
+        inside the content card) only disappear if we force a re-detect
+        here — including bg_color (which controls what the corner-blend
+        squares actually render) and border_color."""
+        for child in widget.winfo_children():
+            try:
+                is_transparent = child.cget("fg_color") == "transparent"
+            except Exception:
+                is_transparent = False
+            if is_transparent:
+                try:
+                    if isinstance(child, ctk.CTkScrollableFrame):
+                        # Scrollable frames need fg_color re-triggered so the
+                        # internal canvas picks up the new parent color.
+                        child.configure(fg_color="transparent")
+                        child.configure(bg_color="transparent")
+                    else:
+                        # Re-detect the parent's new color, then re-cascade.
+                        # Setting both bg_color and fg_color to "transparent"
+                        # forces the widget to re-sample its parent instead
+                        # of using the stale snapshot captured at creation.
+                        child.configure(bg_color="transparent")
+                        child.configure(fg_color="transparent")
+                except Exception:
+                    pass
+            # Always recurse — grandchildren may be transparent too and
+            # won't be refreshed otherwise.
+            self._refresh_transparent_colors(child)
 
     def _apply_shell_corners(self):
         """Blends the four corner squares of the shell cards into the backdrop
@@ -1085,7 +1268,7 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
             self.nav_buttons[name] = btn
 
         footer = ctk.CTkFrame(sidebar, fg_color="transparent")
-        footer.pack(fill="x", padx=14, pady=(0, 16))
+        footer.pack(fill="x", padx=14, pady=(0, 30))
         ctk.CTkLabel(
             footer,
             text=f"v{APP_VERSION}",
@@ -1107,21 +1290,45 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
                 fg_color=self.accent if name == tab else "transparent"
             )
 
-        for child in self.content.winfo_children():
-            child.destroy()
+        # Tabs are built once and cached; switching just shows/hides them.
+        # Rebuilding hundreds of widgets on every tab change was the main
+        # cause of slow tab movement.
+        for other_tab, other_frame in self._tab_frames.items():
+            if other_tab != tab:
+                other_frame.pack_forget()
 
+        frame = self._tab_frames.get(tab)
+        if frame is None:
+            frame = ctk.CTkFrame(self.content, fg_color="transparent")
+            self._tab_frames[tab] = frame
+            self._build_tab(tab, frame)
+        # Pack in BOTH cases — newly built frames too, otherwise the tab
+        # renders as an empty panel on its first visit. The 26px inset keeps
+        # every transparent child clear of the shell card's 24px corner
+        # blend, so the rounded corners stay visible (no "pointy edges").
+        frame.pack(fill="both", expand=True, padx=26, pady=26)
+
+        # Refresh live content when re-entering a cached tab.
         if tab == "Play":
-            self.show_play()
+            self.refresh_accounts()
         elif tab == "Mod Manager":
-            self.show_mod_manager()
+            self.refresh_mods()
         elif tab == "Servers":
-            self.show_servers()
+            self.refresh_all_servers()
+
+    def _build_tab(self, tab, frame):
+        if tab == "Play":
+            self.show_play(frame)
+        elif tab == "Mod Manager":
+            self.show_mod_manager(frame)
+        elif tab == "Servers":
+            self.show_servers(frame)
         elif tab == "Modpacks":
-            self.show_modpacks()
+            self.show_modpacks(frame)
         elif tab == "Settings":
-            self.show_settings()
+            self.show_settings(frame)
         else:
-            self.show_about()
+            self.show_about(frame)
 
     def _load_theme(self):
         """Applies the saved theme palette to the module-level color globals."""
@@ -1138,7 +1345,15 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         tab = self.current_tab
         for child in self.winfo_children():
             child.destroy()
+        self._tab_frames = {}
+        self._version_rows = {}
+        self._rendered_count = 0
+        self._version_footer_lbl = None
         self.bg_photo = None
+        # Force the background to re-render on the freshly rebuilt canvas
+        # (same size would otherwise be skipped by the render guard, leaving
+        # the backdrop blank until the next resize).
+        self._bg_render_size = (0, 0)
         self._last_win_size = (0, 0)
         self._build_base()
         self.switch_tab(tab)
@@ -1166,8 +1381,8 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         self._rebuild_ui()
         log("Accent changed:", name)
 
-    def show_play(self):
-        root = ctk.CTkFrame(self.content, fg_color="transparent")
+    def show_play(self, parent=None):
+        root = ctk.CTkFrame(parent or self.content, fg_color="transparent")
         root.pack(fill="both", expand=True, padx=10, pady=10)
         root.grid_columnconfigure(0, weight=0)
         root.grid_columnconfigure(1, weight=1)
@@ -1329,7 +1544,7 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         panel.grid(row=0, column=1, sticky="nsew")
 
         panel.grid_columnconfigure(0, weight=1)
-        panel.grid_rowconfigure(3, weight=1)
+        panel.grid_rowconfigure(4, weight=1)
 
         ctk.CTkLabel(
             panel,
@@ -1346,8 +1561,11 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         ).grid(row=1, column=0, sticky="w", padx=28)
 
         controls = ctk.CTkFrame(panel, fg_color="transparent")
-        controls.grid(row=2, column=0, sticky="ew", padx=28, pady=18)
-        
+        controls.grid(row=2, column=0, sticky="ew", padx=28, pady=(18, 8))
+        controls.grid_columnconfigure(0, weight=1)
+
+        # The search gets its own full-width row so it never collapses in
+        # windowed mode (a grid trailing widget shrinks to ~0 px otherwise).
         self.search = ctk.CTkEntry(
             controls,
             height=40,
@@ -1356,9 +1574,8 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
             border_color=OUTLINE,
             placeholder_text="Search versions...",
         )
-        self.search.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        controls.grid_columnconfigure(0, weight=1)
-        
+        self.search.grid(row=0, column=0, columnspan=4, sticky="ew")
+
         self._search_job = None
         def schedule_version_filter(_event=None):
             if self._search_job is not None:
@@ -1367,7 +1584,9 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
             self._search_job = self.after(80, self.filter_versions)
         self.search.bind("<KeyRelease>", schedule_version_filter)
 
-        self.installed_var = ctk.BooleanVar(value=False)
+        # "Installed" starts ON on every launch (regardless of the previous
+        # session) so the version list stays short and loads fast.
+        self.installed_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
             controls,
             text="Installed",
@@ -1377,7 +1596,7 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
             hover_color=self.accent,
             border_width=2,
             corner_radius=6,
-        ).grid(row=0, column=1, padx=(0, 10))
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
 
         self.snapshot_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
@@ -1389,7 +1608,7 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
             hover_color=self.accent,
             border_width=2,
             corner_radius=6,
-        ).grid(row=0, column=2, padx=(0, 10))
+        ).grid(row=1, column=1, sticky="w", padx=(14, 0), pady=(8, 0))
 
         self.loader_var = ctk.StringVar(value="All Loaders")
         ctk.CTkComboBox(
@@ -1397,25 +1616,13 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
             values=["All Loaders", "Vanilla", "Fabric", "Forge", "Quilt"],
             variable=self.loader_var,
             command=self.filter_versions,
-            width=130,
-            height=36,
+            width=170,
+            height=40,
+            font=ctk.CTkFont(size=12, weight="bold"),
             corner_radius=10,
             fg_color=CARD_2,
             border_color=OUTLINE,
-        ).grid(row=0, column=3)
-        # Fallback only: hidden automatically once the online loader catalog
-        # loads and uninstalled loader versions appear in the list below.
-        self.install_loader_btn = ctk.CTkButton(
-            controls,
-            text="+ Install Loader",
-            height=36,
-            corner_radius=10,
-            fg_color=self.accent,
-            hover_color=self.accent,
-            font=ctk.CTkFont(size=12, weight="bold"),
-            command=self.open_mod_installer,
-        )
-        self.install_loader_btn.grid(row=0, column=4, padx=(10, 0))
+        ).grid(row=1, column=2, sticky="w", padx=(14, 0), pady=(6, 0))
 
         self.version_frame = ctk.CTkScrollableFrame(
             panel,
@@ -1424,10 +1631,10 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
             border_width=1,
             border_color=OUTLINE,
         )
-        self.version_frame.grid(row=3, column=0, sticky="nsew", padx=28, pady=(0, 15))
+        self.version_frame.grid(row=4, column=0, sticky="nsew", padx=28, pady=(0, 15))
 
         bottom = ctk.CTkFrame(panel, fg_color="transparent")
-        bottom.grid(row=4, column=0, sticky="ew", padx=28, pady=(0, 24))
+        bottom.grid(row=5, column=0, sticky="ew", padx=28, pady=(0, 24))
         bottom.grid_columnconfigure(1, weight=1)
 
         self.status_label = ctk.CTkLabel(
@@ -1442,6 +1649,38 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         self.progress.grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.progress.set(0)
 
+                # Prominent "selected version" banner between the filters / search and
+        # the version list. Full-width so it always has room (unlike a cramped
+        # label squeezed next to the launch button) and shows at a glance what's
+        # ready to play. No icon — just the label + version name.
+        sel_banner = ctk.CTkFrame(
+            panel,
+            fg_color=CARD_2,
+            corner_radius=14,
+            border_width=1,
+            border_color=OUTLINE,
+            height=42,
+        )
+        sel_banner.grid(row=3, column=0, sticky="ew", padx=28, pady=(0, 12))
+        sel_banner.grid_propagate(False)
+
+        # Subtle label on the left
+        ctk.CTkLabel(
+            sel_banner,
+            text="SELECTED",
+            text_color=MUTED,
+            font=ctk.CTkFont(size=10, weight="bold"),
+        ).pack(side="left", padx=(18, 8))
+
+        # Prominent version name (accent-colored when a version is chosen)
+        self.selected_version_lbl = ctk.CTkLabel(
+            sel_banner,
+            text="Not selected",
+            text_color=MUTED,
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        self.selected_version_lbl.pack(side="left", padx=4)
+
         self.launch_btn = ctk.CTkButton(
             bottom,
             text="▶  L A U N C H",
@@ -1455,85 +1694,157 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         )
         self.launch_btn.grid(row=0, column=2, rowspan=2, sticky="e")
 
+        self._update_selected_version_display()
         self.filter_versions()
 
-    def load_version_data(self):
+    def load_version_data(self, force_online: bool = False):
         try:
-            from minecraft_launcher_lib import utils
-
             mc_dir = self.minecraft_directory
             Path(mc_dir).mkdir(parents=True, exist_ok=True)
 
             self.installed_versions = self._scan_installed_versions()
 
+            # The Mojang + loader catalogs are cached to disk so the version
+            # list appears instantly at startup; they are re-fetched online
+            # only when the cache is old, missing, or force_online is set.
+            if force_online or not self._version_cache_loaded:
+                vanilla, loader_entries, cache_used = self._get_version_catalogs(force_online)
+                self._vanilla_versions = vanilla
+                self._loader_entries = loader_entries
+                self._version_cache_loaded = True
+                if cache_used and (time.time() - self._cache_fetched_at) > VERSION_CACHE_TTL:
+                    # Cache is stale: serve it now, refresh silently behind it.
+                    threading.Thread(
+                        target=lambda: self.load_version_data(force_online=True),
+                        daemon=True,
+                    ).start()
+
+            self._rebuild_version_list()
+            log(f"Loaded {len(self.versions)} versions "
+                f"({len(self._loader_entries)} loader entries).")
+        except Exception as exc:
+            log("Version fetch error:", exc)
+            self.ui(lambda: self.set_status(f"Version error: {exc}"))
+
+    def _get_version_catalogs(self, force_online: bool):
+        """Returns (vanilla, loader_entries, cache_used). Reads the disk cache
+        first for an instant startup; refreshes online when missing, stale or
+        when force_online is set."""
+        if not force_online:
+            cache = load_json(VERSION_CACHE_FILE, None)
+            if isinstance(cache, dict) and cache.get("vanilla"):
+                self._cache_fetched_at = float(cache.get("fetched_at", 0) or 0)
+                self._loader_catalog_loaded = bool(cache.get("catalog_loaded"))
+                return cache["vanilla"], cache.get("loader", []) or [], True
+
+        try:
+            from minecraft_launcher_lib import utils
+
             raw = utils.get_version_list()
             vanilla: list[dict[str, Any]] = []
             if isinstance(raw, list):
                 for item in raw:
-                    if isinstance(item, dict):
-                        vid = str(item.get("id", ""))
+                    if isinstance(item, dict) and item.get("id"):
                         vanilla.append({
-                            "id": vid,
+                            "id": str(item.get("id")),
                             "type": str(item.get("type", "release")),
-                            "installed": vid in self.installed_versions,
                         })
 
             # Fetch the online mod-loader catalogs (Fabric / Forge / Quilt) so
             # uninstalled loader versions show up inside the main version list.
             loader_entries = self._fetch_loader_catalog()
 
-            self._version_meta = {}
-            for entry in loader_entries:
-                self._version_meta[entry["id"]] = entry
-
-            by_mc: dict[str, list[dict[str, Any]]] = {}
-            for entry in loader_entries:
-                by_mc.setdefault(entry["mc_version"], []).append(entry)
-            for group in by_mc.values():
-                group.sort(key=lambda e: e["loader"])
-
-            # Interleave loader entries directly beneath their Minecraft
-            # version so they appear in the "main version place".
-            merged: list[dict[str, Any]] = []
-            covered_mc = set()
-            for item in vanilla:
-                merged.append(item)
-                group = by_mc.get(item["id"])
-                if group:
-                    covered_mc.add(item["id"])
-                    merged.extend(group)
-            for mc, group in by_mc.items():
-                if mc not in covered_mc:
-                    merged.extend(group)
-
-            # Installed loader folders are already represented above; only
-            # surface genuinely custom/unknown version directories here.
-            def _represented_by_catalog(name: str) -> bool:
-                return self._loader_catalog_loaded and (
-                    name.startswith("fabric-loader-")
-                    or name.startswith("quilt-loader-")
-                    or name.startswith("forge-")
-                    or "-forge-" in name
-                )
-
-            for installed in self.installed_versions:
-                if _represented_by_catalog(installed):
-                    continue
-                if not any(v["id"] == installed for v in merged):
-                    merged.append({
-                        "id": installed,
-                        "type": "custom",
-                        "installed": True,
-                    })
-
-            self.versions = merged
-            self.ui(self.filter_versions)
-            self.ui(self._update_install_loader_btn_visibility)
-            log(f"Loaded {len(self.versions)} versions "
-                f"({len(loader_entries)} loader entries).")
+            save_json(VERSION_CACHE_FILE, {
+                "fetched_at": time.time(),
+                "catalog_loaded": self._loader_catalog_loaded,
+                "vanilla": vanilla,
+                "loader": loader_entries,
+            })
+            self._cache_fetched_at = time.time()
+            return vanilla, loader_entries, False
         except Exception as exc:
-            log("Version fetch error:", exc)
-            self.ui(lambda: self.set_status(f"Version error: {exc}"))
+            log("Online version fetch failed:", exc)
+            cache = load_json(VERSION_CACHE_FILE, None)
+            if isinstance(cache, dict) and cache.get("vanilla"):
+                self._cache_fetched_at = float(cache.get("fetched_at", 0) or 0)
+                self._loader_catalog_loaded = bool(cache.get("catalog_loaded"))
+                return cache["vanilla"], cache.get("loader", []) or [], True
+            raise
+
+    def _rebuild_version_list(self):
+        """Merges the vanilla list + loader catalog + installed folders into
+        the displayable version list and refreshes the UI."""
+        raw_vanilla = self._vanilla_versions
+
+        # Loader entries get live installed flags (disk state may have changed
+        # without the catalogs changing).
+        self._version_meta = {}
+        for entry in self._loader_entries:
+            entry = dict(entry)
+            loader = entry.get("loader")
+            mc = entry.get("mc_version", "")
+            if loader in ("fabric", "quilt"):
+                entry["installed"] = any(
+                    iv.startswith(f"{loader}-loader-") and iv.endswith(f"-{mc}")
+                    for iv in self.installed_versions
+                )
+            elif loader == "forge":
+                entry["installed"] = entry.get("id") in self.installed_versions
+            self._version_meta[entry["id"]] = entry
+
+        by_mc: dict[str, list[dict[str, Any]]] = {}
+        for entry in self._version_meta.values():
+            by_mc.setdefault(entry["mc_version"], []).append(entry)
+        for group in by_mc.values():
+            group.sort(key=lambda e: e["loader"])
+
+        vanilla: list[dict[str, Any]] = []
+        for item in raw_vanilla:
+            vid = item.get("id", "")
+            if not vid:
+                continue
+            vanilla.append({
+                "id": vid,
+                "type": str(item.get("type", "release")),
+                "installed": vid in self.installed_versions,
+            })
+
+        # Interleave loader entries directly beneath their Minecraft
+        # version so they appear in the "main version place".
+        merged: list[dict[str, Any]] = []
+        covered_mc = set()
+        for item in vanilla:
+            merged.append(item)
+            group = by_mc.get(item["id"])
+            if group:
+                covered_mc.add(item["id"])
+                merged.extend(group)
+        for mc, group in by_mc.items():
+            if mc not in covered_mc:
+                merged.extend(group)
+
+        # Installed loader folders are already represented above; only
+        # surface genuinely custom/unknown version directories here.
+        def _represented_by_catalog(name: str) -> bool:
+            return self._loader_catalog_loaded and (
+                name.startswith("fabric-loader-")
+                or name.startswith("quilt-loader-")
+                or name.startswith("forge-")
+                or "-forge-" in name
+            )
+
+        for installed in self.installed_versions:
+            if _represented_by_catalog(installed):
+                continue
+            if not any(v["id"] == installed for v in merged):
+                merged.append({
+                    "id": installed,
+                    "type": "custom",
+                    "installed": True,
+                })
+
+        self.versions = merged
+        self.ui(self.filter_versions)
 
     @staticmethod
     def _stable_loader_versions(api) -> list[str]:
@@ -1656,17 +1967,6 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         self._loader_catalog_loaded = bool(entries)
         return entries
 
-    def _update_install_loader_btn_visibility(self):
-        """Hides the fallback '+ Install Loader' button once the online
-        loader catalog is available in the main version list."""
-        btn = getattr(self, "install_loader_btn", None)
-        if btn is None:
-            return
-        if self._loader_catalog_loaded:
-            btn.grid_remove()
-        else:
-            btn.grid()
-
     def _scan_installed_versions(self) -> set[str]:
         """Re-scans the <minecraft>/versions directory and refreshes the
         installed-version cache straight from disk."""
@@ -1732,7 +2032,8 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
             actual = meta["id"]
             set_status(f"Installing Forge {actual}...")
             mll.forge.install_forge_version(
-                meta.get("forge_build", actual), self.minecraft_directory, callback=cb
+                meta.get("forge_build", actual), self.minecraft_directory, callback=cb,
+                java=self.java_path or None,
             )
         else:
             raise Exception(f"Unknown mod loader: {loader}")
@@ -1744,14 +2045,6 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         # installed version is flagged installed without relaunching.
         threading.Thread(target=self.load_version_data, daemon=True).start()
         return actual
-
-    def open_mod_installer(self):
-        InstallModDialog(
-            parent=self,
-            mc_dir=self.minecraft_directory,
-            accent_color=self.accent,
-            on_complete_callback=lambda: threading.Thread(target=self.load_version_data, daemon=True).start()
-        )
 
     def filter_versions(self, *_args):
         query = self.search.get().lower().strip() if hasattr(self, "search") else ""
@@ -1790,58 +2083,110 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         if hasattr(self, "version_frame"):
             self._draw_visible_versions()
 
+    _VERSION_CHUNK = 40
+    _VERSION_CAP = 150
+
     def _draw_visible_versions(self):
+        """Renders the version list in small chunks so building hundreds of
+        rows never blocks the UI thread in one go."""
+        self._draw_generation += 1
+        gen = self._draw_generation
         for widget in self.version_frame.winfo_children():
             widget.destroy()
+        self._version_rows = {}
+        self._rendered_count = 0
+        self._version_footer_lbl = None
 
-        if not self._filtered_versions:
-            lbl = ctk.CTkLabel(
+        if not self.versions:
+            msg = "Loading versions..."
+        elif not self._filtered_versions:
+            installed_only = (
+                self.installed_var.get() if hasattr(self, "installed_var") else False
+            )
+            has_installed = any(v.get("installed") for v in self.versions)
+            if installed_only and not has_installed:
+                msg = "No installed versions yet.\nUncheck 'Installed' to browse and install."
+            else:
+                msg = "No matching versions found."
+        else:
+            msg = None
+
+        if msg:
+            ctk.CTkLabel(
                 self.version_frame,
-                text="No matching versions found.",
+                text=msg,
                 text_color=MUTED,
                 font=ctk.CTkFont(size=14),
-            )
-            lbl.pack(pady=40)
+                justify="center",
+            ).pack(pady=40)
             return
 
-        for idx, item in enumerate(self._filtered_versions[:150]):
-            self._create_version_item(item, idx)
-            
-        if len(self._filtered_versions) > 150:
-            ctk.CTkLabel(
-                self.version_frame, 
-                text=f"...and {len(self._filtered_versions)-150} more. Refine your search.",
-                text_color=MUTED
-            ).pack(pady=10)
+        self._append_version_rows(gen)
+
+    def _append_version_rows(self, gen=None):
+        """Appends the next chunk of version rows (scheduled off-cycle so the
+        UI stays responsive)."""
+        if gen is not None and gen != self._draw_generation:
+            return  # a newer redraw superseded this batch
+        if not hasattr(self, "version_frame"):
+            return
+
+        start = self._rendered_count
+        limit = min(len(self._filtered_versions), self._VERSION_CAP)
+        end = min(start + self._VERSION_CHUNK, limit)
+        for idx in range(start, end):
+            self._create_version_item(self._filtered_versions[idx], idx)
+        self._rendered_count = end
+        self._update_versions_footer()
+
+        if end < limit:
+            self.after(20, lambda: self._append_version_rows(gen))
+
+    def _update_versions_footer(self):
+        hidden = len(self._filtered_versions) - self._rendered_count
+        text = f"...and {hidden} more. Refine your search." if hidden > 0 else ""
+        lbl = self._version_footer_lbl
+        if text:
+            if lbl is None or not lbl.winfo_exists():
+                self._version_footer_lbl = ctk.CTkLabel(
+                    self.version_frame, text=text, text_color=MUTED
+                )
+                # Pinned to the bottom so appended rows never push it away.
+                self._version_footer_lbl.pack(side="bottom", pady=10)
+            else:
+                self._version_footer_lbl.configure(text=text)
+        elif lbl is not None and lbl.winfo_exists():
+            lbl.pack_forget()
 
     def _create_version_item(self, item, index):
         vid = item["id"]
         is_installed = item.get("installed", False)
         vtype = item.get("type", "unknown")
+        is_selected = self.selected_version == vid
 
         bg = CARD if index % 2 == 0 else "transparent"
         row = ctk.CTkFrame(self.version_frame, fg_color=bg, height=45, corner_radius=10)
         row.pack(fill="x", pady=2, padx=4)
         row.pack_propagate(False)
 
-        indicator_color = SUCCESS if is_installed else MUTED
-        ctk.CTkFrame(row, width=4, corner_radius=2, fg_color=indicator_color).pack(
-            side="left", fill="y", pady=6, padx=(8, 12)
-        )
+        # Colored status bar for installed rows only (fewer widgets per row).
+        if is_installed:
+            ctk.CTkFrame(row, width=4, corner_radius=2, fg_color=SUCCESS).pack(
+                side="left", fill="y", pady=6, padx=(8, 12)
+            )
 
-        font = ctk.CTkFont(size=13, weight="bold")
-        lbl = ctk.CTkLabel(row, text=vid, font=font, text_color=TEXT, anchor="w")
-        lbl.pack(side="left")
+        lbl = ctk.CTkLabel(
+            row, text=vid, font=self._f_ver_name, text_color=TEXT, anchor="w"
+        )
+        lbl.pack(side="left", padx=(0 if is_installed else 12, 0))
 
         type_lbl = ctk.CTkLabel(
             row,
             text=vtype.upper(),
-            font=ctk.CTkFont(size=9, weight="bold"),
+            font=self._f_ver_type,
             text_color=LOADER_BADGE_COLORS.get(vtype, MUTED),
         )
         type_lbl.pack(side="left", padx=10)
-
-        is_selected = self.selected_version == vid
 
         if is_installed:
             ctk.CTkButton(
@@ -1852,7 +2197,7 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
                 corner_radius=8,
                 fg_color=CARD_2,
                 hover_color=ERROR,
-                font=ctk.CTkFont(size=11),
+                font=self._f_ver_btn,
                 command=lambda v=vid: self.delete_version(v),
             ).pack(side="right", padx=(0, 6))
 
@@ -1864,7 +2209,7 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
             corner_radius=8,
             fg_color=self.accent if is_selected else CARD_2,
             hover_color=self.accent,
-            font=ctk.CTkFont(size=11, weight="bold"),
+            font=self._f_ver_btn,
             command=lambda v=vid: self.select_version(v),
         )
         btn.pack(side="right", padx=12)
@@ -1873,13 +2218,64 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
             row.configure(border_width=1, border_color=self.accent)
             lbl.configure(text_color=self.accent)
 
+        # Register the row so selection changes restyle in place instead of
+        # rebuilding the whole list.
+        self._version_rows[vid] = {
+            "row": row, "lbl": lbl, "btn": btn, "installed": is_installed,
+        }
+
     def select_version(self, vid):
         if self.busy:
             return
+        old = self.selected_version
         self.selected_version = vid
-        self._draw_visible_versions()
+        # Restyle only the affected rows in place — rebuilding the entire list
+        # on every click was a major source of UI lag.
+        if old and old != vid:
+            self._style_version_row(old, False)
+        self._style_version_row(vid, True)
+        self._update_selected_version_display()
         self.set_status(f"Selected: {vid}")
+        # Remember the choice so the launcher re-selects it on next launch.
+        self.settings["last_version"] = vid
+        save_json(SETTINGS_FILE, self.settings)
         log("Selected version:", vid)
+
+    def _update_selected_version_display(self):
+        """Refreshes the prominent 'selected version' readout on the Play page."""
+        lbl = getattr(self, "selected_version_lbl", None)
+        if lbl is None:
+            return
+        vid = self.selected_version
+        try:
+            if vid:
+                lbl.configure(text=vid, text_color=self.accent)
+            else:
+                lbl.configure(text="Not selected", text_color=MUTED)
+        except Exception:
+            pass
+
+    def _style_version_row(self, vid, selected: bool):
+        info = self._version_rows.get(vid)
+        if not info:
+            return
+        try:
+            if selected:
+                info["row"].configure(border_width=1, border_color=self.accent)
+                info["lbl"].configure(text_color=self.accent)
+                info["btn"].configure(
+                    text="Selected", fg_color=self.accent, hover_color=self.accent
+                )
+            else:
+                info["row"].configure(border_width=0)
+                info["lbl"].configure(text_color=TEXT)
+                info["btn"].configure(
+                    text="Play" if info.get("installed") else "Install",
+                    fg_color=CARD_2,
+                    hover_color=self.accent,
+                )
+        except Exception:
+            pass
 
     def delete_version(self, vid):
         """Permanently deletes the installed version folder(s) behind a
@@ -1946,6 +2342,8 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         if deleted:
             if self.selected_version == vid:
                 self.selected_version = None
+                self.settings["last_version"] = ""
+                save_json(SETTINGS_FILE, self.settings)
             threading.Thread(target=self.load_version_data, daemon=True).start()
             self.set_status(f"Deleted {len(deleted)} version(s).")
 
@@ -1977,13 +2375,22 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
             return
 
         java_path = self.java_entry.get().strip() if hasattr(self, "java_entry") else self.java_path
-        if not java_path or not Path(java_path).is_file():
-            messagebox.showerror("Error", "Valid Java executable not found!")
-            return
+        if java_path and not Path(java_path).is_file():
+            # Stale path (e.g. Java was uninstalled) — re-detect below instead
+            # of blocking the launch with an error.
+            java_path = ""
+
+        if not java_path:
+            java_path = find_java()
+            if java_path:
+                self.ui(self._sync_java_entry)
 
         self.java_path = java_path
         self.settings["java_path"] = java_path
         save_json(SETTINGS_FILE, self.settings)
+        # A missing Java is not fatal: vanilla versions use the runtime the
+        # launcher downloads from Mojang, and loader installs auto-download
+        # Java inside the launch thread when needed.
 
         self.busy = True
         self.set_status(f"Preparing to launch {self.selected_version}...")
@@ -2019,6 +2426,11 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
             # their real installed version id here, installing on demand.
             meta = self._version_meta.get(version)
             if meta and meta.get("loader"):
+                if not (java_path and Path(java_path).is_file()):
+                    set_status("Java not found — preparing Java...")
+                    java_path = self._ensure_java_available(set_status)
+                    self.java_path = java_path
+                    self.ui(self._sync_java_entry)
                 version = self._ensure_loader_installed(
                     meta, set_max, set_progress, set_status
                 )
@@ -2053,18 +2465,37 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
                 log(f"Base installer notice: {exc}")
 
             self.ui(self.set_status, f"Resolving Java runtime for {base_version}...")
+            # Preferred: read the exact Java runtime the version JSON asks
+            # for. Works for every version naming scheme (incl. 2026-era
+            # versions like "26.2") — guessing from the version string sent
+            # unknown versions to the legacy Java 8 runtime, which crashed
+            # with "Unrecognized option: --sun-misc-unsafe-memory-access=allow".
+            jvm_name = None
+            base_json_path = Path(mc_dir) / "versions" / base_version / f"{base_version}.json"
             try:
-                jvm_name = runtime.get_jvm_version_for_version(base_version, mc_dir)
-            except Exception:
-                jvm_name = None
+                with open(base_json_path, "r", encoding="utf-8") as f:
+                    jvm_component = (json.load(f).get("javaVersion") or {}).get("component")
+                if jvm_component:
+                    jvm_name = str(jvm_component)
+            except Exception as err:
+                log(f"Could not read javaVersion from {base_json_path.name}: {err}")
+
+            if not jvm_name:
+                try:
+                    jvm_name = runtime.get_jvm_version_for_version(base_version, mc_dir)
+                except Exception:
+                    jvm_name = None
 
             if not jvm_name:
                 if any(v in base_version for v in ["1.20.5", "1.20.6", "1.21", "1.22"]):
                     jvm_name = "java-runtime-delta"
                 elif any(v in base_version for v in ["1.17", "1.18", "1.19", "1.20"]):
                     jvm_name = "java-runtime-gamma"
+                elif re.match(r"^1\.\d+", base_version):
+                    jvm_name = "jre-legacy"  # genuinely ancient (<= 1.16)
                 else:
-                    jvm_name = "jre-legacy"
+                    # Unknown / future naming → modern runtime, never legacy.
+                    jvm_name = "java-runtime-delta"
 
             self.ui(self.set_status, f"Ensuring Java runtime ({jvm_name})...")
             try:
@@ -2081,6 +2512,26 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
                 log(f"JVM download warning: {err}")
 
             executable_path = runtime.get_executable_path(jvm_name, mc_dir)
+
+            if not executable_path or not Path(executable_path).exists():
+                if jvm_name != "java-runtime-delta":
+                    # The requested runtime may be unknown to older launcher
+                    # libs — fall back to the modern shared runtime before
+                    # giving up.
+                    self.ui(self.set_status, "Falling back to java-runtime-delta...")
+                    try:
+                        runtime.install_jvm_runtime(
+                            "java-runtime-delta",
+                            mc_dir,
+                            callback={
+                                "setMax": set_max,
+                                "setProgress": set_progress,
+                                "setStatus": set_status,
+                            },
+                        )
+                    except Exception as err:
+                        log(f"Delta fallback install warning: {err}")
+                    executable_path = runtime.get_executable_path("java-runtime-delta", mc_dir)
 
             if not executable_path or not Path(executable_path).exists():
                 if java_path and Path(java_path).exists():
@@ -2109,6 +2560,8 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
                 "resolutionWidth": str(res_w),
                 "resolutionHeight": str(res_h),
             }
+            if self.settings.get("fullscreen", False):
+                opts["fullscreen"] = True
 
             cmd = command.get_minecraft_command(version, mc_dir, opts)
 
@@ -2146,7 +2599,9 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         self.progress.set(1.0)
         self.launch_btn.configure(state="normal", text="▶  L A U N C H")
         self.busy = False
-        self.load_version_data()
+        # Re-scan the versions directory in the background (no network) so a
+        # freshly installed version shows up without touching UI responsiveness.
+        threading.Thread(target=self.load_version_data, daemon=True).start()
 
     def _on_launch_fail(self, exc):
         self.set_status(f"Launch Error: {exc}")
@@ -2155,9 +2610,9 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         self.busy = False
         messagebox.showerror("Launch Error", f"Failed to launch:\n{exc}")
 
-    def show_mod_manager(self):
+    def show_mod_manager(self, parent=None):
         panel = ctk.CTkFrame(
-            self.content,
+            parent or self.content,
             fg_color="transparent",
             corner_radius=22,
             border_width=1,
@@ -2188,7 +2643,13 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
             placeholder_text="🔍 Search installed mods...",
         )
         self.mod_search_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.mod_search_entry.bind("<KeyRelease>", lambda e: self.refresh_mods())
+        self._mod_search_job = None
+        def schedule_mod_refresh(_event=None):
+            if self._mod_search_job is not None:
+                try: self.after_cancel(self._mod_search_job)
+                except Exception: pass
+            self._mod_search_job = self.after(120, self.refresh_mods)
+        self.mod_search_entry.bind("<KeyRelease>", schedule_mod_refresh)
 
         ctk.CTkButton(
             controls_frame,
@@ -2449,9 +2910,9 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         except Exception as exc:
             messagebox.showerror("Drop Error", f"Failed to install dropped files:\n{exc}")
 
-    def show_servers(self):
+    def show_servers(self, parent=None):
         panel = ctk.CTkFrame(
-            self.content,
+            parent or self.content,
             fg_color="transparent",
             corner_radius=22,
             border_width=1,
@@ -2637,9 +3098,9 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
             pass
         self.set_status(f"Copied {display} to clipboard.")
 
-    def show_modpacks(self):
+    def show_modpacks(self, parent=None):
         panel = ctk.CTkFrame(
-            self.content,
+            parent or self.content,
             fg_color="transparent",
             corner_radius=22,
             border_width=1,
@@ -2689,9 +3150,9 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
 
             ctk.CTkButton(card, text="Install", width=100, height=36, corner_radius=10, fg_color=self.accent, hover_color=self.accent).pack(side="right", padx=20)
 
-    def show_settings(self):
+    def show_settings(self, parent=None):
         panel = ctk.CTkFrame(
-            self.content,
+            parent or self.content,
             fg_color="transparent",
             corner_radius=22,
             border_width=1,
@@ -2763,6 +3224,108 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
             self.directory_entry.insert(0, self.minecraft_directory)
             
         ctk.CTkButton(dir_inner, text="Browse", width=80, fg_color=CARD, hover_color=OUTLINE, command=self._browse_mc_directory).pack(side="left", padx=(10, 0))
+
+        # --- Java runtime management ---
+        self._build_setting_section(scroll, "Java Runtime")
+        java_sec = ctk.CTkFrame(scroll, fg_color=CARD_2, corner_radius=12, border_width=1, border_color=OUTLINE)
+        java_sec.pack(fill="x", pady=(0, 15))
+
+        self.java_auto_var = ctk.BooleanVar(value=bool(self.settings.get("java_automanage", True)))
+        ctk.CTkSwitch(
+            java_sec,
+            text="Auto-manage Java (auto-detect & auto-download)",
+            variable=self.java_auto_var,
+            progress_color=self.accent,
+            command=lambda: self._toggle_java_automange(self.java_auto_var.get()),
+        ).pack(anchor="w", padx=20, pady=(15, 6))
+
+        self.java_status_lbl = ctk.CTkLabel(
+            java_sec,
+            text=self._java_status_text(),
+            text_color=MUTED,
+            font=ctk.CTkFont(size=11),
+            justify="left",
+            anchor="w",
+        )
+        self.java_status_lbl.pack(fill="x", padx=20)
+
+        java_btns = ctk.CTkFrame(java_sec, fg_color="transparent")
+        java_btns.pack(fill="x", padx=20, pady=(8, 4))
+        ctk.CTkButton(
+            java_btns, text="🔍 Detect Java", width=110, height=32, corner_radius=9,
+            fg_color=CARD, hover_color=OUTLINE, command=self._detect_java_clicked,
+        ).pack(side="left")
+        ctk.CTkButton(
+            java_btns, text="📂 Browse", width=90, height=32, corner_radius=9,
+            fg_color=CARD, hover_color=OUTLINE, command=self.browse_java,
+        ).pack(side="left", padx=(8, 0))
+        self.java_dl_btn = ctk.CTkButton(
+            java_btns, text="⬇ Download Java 21", width=150, height=32, corner_radius=9,
+            fg_color=self.accent, hover_color=self.accent,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._download_java_clicked,
+        )
+        self.java_dl_btn.pack(side="left", padx=(8, 0))
+
+        self.java_progress_lbl = ctk.CTkLabel(
+            java_sec, text="", text_color=MUTED, font=ctk.CTkFont(size=10)
+        )
+        self.java_progress_lbl.pack(anchor="w", padx=20, pady=(0, 14))
+
+        # --- JVM arguments ---
+        jvm_row = ctk.CTkFrame(scroll, fg_color=CARD_2, corner_radius=12, border_width=1, border_color=OUTLINE)
+        jvm_row.pack(fill="x", pady=(0, 15))
+        jvm_inner = ctk.CTkFrame(jvm_row, fg_color="transparent")
+        jvm_inner.pack(fill="x", padx=20, pady=12)
+        ctk.CTkLabel(
+            jvm_inner, text="JVM Arguments (advanced)",
+            text_color=TEXT, font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(anchor="w")
+        self.jvm_args_entry = ctk.CTkEntry(
+            jvm_inner, placeholder_text="-XX:+UseG1GC -XX:MaxGCPauseMillis=50",
+            fg_color=CARD, border_color=OUTLINE,
+        )
+        self.jvm_args_entry.pack(fill="x", pady=(6, 2))
+        if self.settings.get("jvm_args"):
+            self.jvm_args_entry.insert(0, self.settings.get("jvm_args"))
+        self.jvm_args_entry.bind("<Return>", lambda e: self._save_jvm_args())
+        self.jvm_args_entry.bind("<FocusOut>", lambda e: self._save_jvm_args())
+        ctk.CTkLabel(
+            jvm_inner,
+            text="Extra flags for the game JVM. Press Enter to save. RAM is set by the slider below.",
+            text_color=MUTED, font=ctk.CTkFont(size=10), justify="left", anchor="w",
+        ).pack(anchor="w")
+
+        # --- Game window ---
+        self._build_setting_section(scroll, "Game Window")
+        win_frame = ctk.CTkFrame(scroll, fg_color=CARD_2, corner_radius=12, border_width=1, border_color=OUTLINE)
+        win_frame.pack(fill="x", pady=(0, 15))
+        win_inner = ctk.CTkFrame(win_frame, fg_color="transparent")
+        win_inner.pack(fill="x", padx=20, pady=12)
+
+        res_row = ctk.CTkFrame(win_inner, fg_color="transparent")
+        res_row.pack(fill="x")
+        ctk.CTkLabel(res_row, text="Width", text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
+        self.width_entry = ctk.CTkEntry(res_row, width=90, fg_color=CARD, border_color=OUTLINE)
+        self.width_entry.pack(side="left", padx=(8, 18))
+        self.width_entry.insert(0, str(int(self.settings.get("width", 1920))))
+        ctk.CTkLabel(res_row, text="Height", text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left")
+        self.height_entry = ctk.CTkEntry(res_row, width=90, fg_color=CARD, border_color=OUTLINE)
+        self.height_entry.pack(side="left", padx=(8, 0))
+        self.height_entry.insert(0, str(int(self.settings.get("height", 1080))))
+        self.width_entry.bind("<Return>", lambda e: self._save_resolution())
+        self.width_entry.bind("<FocusOut>", lambda e: self._save_resolution())
+        self.height_entry.bind("<Return>", lambda e: self._save_resolution())
+        self.height_entry.bind("<FocusOut>", lambda e: self._save_resolution())
+
+        self.fullscreen_var = ctk.BooleanVar(value=bool(self.settings.get("fullscreen", False)))
+        ctk.CTkSwitch(
+            win_inner,
+            text="Start Minecraft fullscreen (ignores resolution)",
+            variable=self.fullscreen_var,
+            progress_color=self.accent,
+            command=lambda: self._save_setting("fullscreen", bool(self.fullscreen_var.get())),
+        ).pack(anchor="w", pady=(10, 0))
 
         self._build_setting_section(scroll, "Memory Allocation")
         self.ram_var = ctk.IntVar(value=int(self.settings.get("ram", 6)))
@@ -2891,6 +3454,80 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         self.settings[key] = value
         save_json(SETTINGS_FILE, self.settings)
 
+    def _toggle_java_automange(self, val):
+        self._save_setting("java_automanage", bool(val))
+        # Turning auto-manage ON when no Java exists kicks off detect/download.
+        if val and not (self.java_path and Path(self.java_path).is_file()):
+            self._detect_java_clicked()
+
+    def _detect_java_clicked(self):
+        self._set_java_progress("Searching for Java installations...", MUTED)
+
+        def worker():
+            found = self._auto_java_worker(
+                set_progress=lambda p: self.ui(
+                    self._set_java_progress,
+                    f"Downloading Java 21 (Temurin)... {int(p)}%", MUTED,
+                )
+            )
+
+            def done():
+                if found:
+                    self._set_java_progress("Java ready ✓", SUCCESS)
+                else:
+                    self._set_java_progress(
+                        "No Java found and auto-manage is OFF.\n"
+                        "Enable it or click 'Download Java 21'.",
+                        ERROR,
+                    )
+
+            self.ui(done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _download_java_clicked(self):
+        btn = getattr(self, "java_dl_btn", None)
+        if btn is not None:
+            btn.configure(state="disabled")
+        self._set_java_progress("Downloading Java 21 (Temurin JRE)... 0%", MUTED)
+
+        def worker():
+            def report(pct):
+                self.ui(
+                    self._set_java_progress,
+                    f"Downloading Java 21 (Temurin JRE)... {int(pct)}%", MUTED,
+                )
+            try:
+                path = download_java_runtime(21, progress_cb=report)
+                self.java_path = path
+                self.settings["java_path"] = path
+                save_json(SETTINGS_FILE, self.settings)
+                self.ui(self._sync_java_entry)
+                self.ui(self._set_java_progress, "Java 21 installed ✓", SUCCESS)
+            except Exception as exc:
+                log("Java download failed:", exc)
+                self.ui(self._set_java_progress, f"Download failed: {exc}", ERROR)
+            finally:
+                if btn is not None:
+                    self.ui(lambda: btn.configure(state="normal"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _save_jvm_args(self):
+        if hasattr(self, "jvm_args_entry"):
+            self._save_setting("jvm_args", self.jvm_args_entry.get().strip())
+
+    def _save_resolution(self):
+        if hasattr(self, "width_entry") and hasattr(self, "height_entry"):
+            try:
+                w = max(640, int(self.width_entry.get()))
+                h = max(480, int(self.height_entry.get()))
+            except ValueError:
+                return
+            self.settings["width"] = w
+            self.settings["height"] = h
+            save_json(SETTINGS_FILE, self.settings)
+
     def _toggle_discord(self, enabled):
         self._save_setting("discord_rpc", enabled)
         if enabled:
@@ -2900,116 +3537,158 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         else:
             self.discord.shutdown()
 
-    def _load_background_image(self):
-        if not hasattr(self, "bg_canvas"):
+    def _load_background_image(self, *_args):
+        if not hasattr(self, "bg_canvas") or self.closing:
             return
 
-        self.update_idletasks()
-        width = max(self.winfo_width(), 1050)
-        height = max(self.winfo_height(), 700)
-
-        raw_path = str(self.settings.get("background", "")).strip().strip('"\'')
+        raw_path = str(self.settings.get("background", "")).strip().strip("\"'")
         if not raw_path:
             self._glass_mode = False
             self.bg_canvas.delete("bg_img")
             self.bg_canvas.configure(bg=BG_DARK)
             return
-
         bg_path = Path(raw_path)
         if not bg_path.exists() or not bg_path.is_file():
             self._glass_mode = False
             self.bg_canvas.delete("bg_img")
             self.bg_canvas.configure(bg=BG_DARK)
             return
-
         if not Image or not ImageTk:
             return
 
+        self.update_idletasks()
+        width = max(self.winfo_width(), 1050)
+        height = max(self.winfo_height(), 700)
+
+        # Skip duplicate renders at the same size (moving the window fires
+        # Configure events without changing the size).
+        if self._glass_mode and self._bg_render_size == (width, height):
+            return
+
+        # Decode the source image only once and cache it — re-decoding a large
+        # PNG/JPG on every resize was a major drag while resizing the window.
+        if self._bg_src_path != raw_path or self._bg_src_img is None:
+            try:
+                self._bg_src_img = Image.open(bg_path).convert("RGBA")
+                self._bg_src_path = raw_path
+            except Exception as exc:
+                log(f"Background open failed: {exc}")
+                return
+
+        src_img = self._bg_src_img
+        self._bg_render_token += 1
+        token = self._bg_render_token
+
+        # All PIL work happens off the UI thread; only the final PhotoImage
+        # creation touches Tk (which must stay on the main thread).
+        def worker():
+            try:
+                pil, avg = self._render_background_pil(src_img, width, height)
+            except Exception as exc:
+                log(f"Background render failed: {exc}")
+                return
+            self.ui(lambda: self._apply_background_pil(pil, avg, width, height, token))
+
+        threading.Thread(target=worker, name="JanksyBgRender", daemon=True).start()
+
+    def _render_background_pil(self, img, width, height):
+        """Pure-PIL work (safe to run off the UI thread): cover-fit resize,
+        tint and card shadows. Returns the composed image + average color."""
+        img_w, img_h = img.size
+        scale = max(width / img_w, height / img_h)
+        new_w, new_h = max(width, int(img_w * scale)), max(height, int(img_h * scale))
+
+        # BILINEAR is several times faster than LANCZOS; on a background image
+        # the quality difference is imperceptible.
+        resized = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+
+        left = (new_w - width) // 2
+        top = (new_h - height) // 2
+        cropped = resized.crop((left, top, left + width, top + height))
+
+        # Light veil so the artwork stays bright and clearly visible.
+        dark_tint = Image.new("RGBA", (width, height), (15, 17, 23, 70))
+        glass_final = Image.alpha_composite(cropped, dark_tint)
+
+        # Average colour of the artwork, used for the glass-panel tint.
+        avg = cropped.resize((1, 1), Image.Resampling.BILINEAR).getpixel((0, 0))
+        avg = avg[:3]
+
+        # Soft blurred shadows behind the two glass cards smooth the harsh
+        # cardboard-color transition between the artwork and the curved
+        # shell corners (hiding the frame corner squares).
         try:
             from PIL import ImageDraw, ImageFilter
-
-            img = Image.open(bg_path).convert("RGBA")
-
-            img_w, img_h = img.size
-            scale = max(width / img_w, height / img_h)
-            new_w, new_h = int(img_w * scale), int(img_h * scale)
-
-            resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
-            left = (new_w - width) // 2
-            top = (new_h - height) // 2
-            cropped = resized.crop((left, top, left + width, top + height))
-
-            # Light veil so the artwork stays bright and clearly visible.
-            dark_tint = Image.new("RGBA", (width, height), (15, 17, 23, 70))
-            glass_final = Image.alpha_composite(cropped, dark_tint)
-
-            # Derive the tint for the shell cards from the artwork, so
-            # the cards feel like part of the image (and their corner squares
-            # stop clashing as hard dark notches). Store the average colour and
-            # compute the glass fill from the current opacity slider.
-            avg = cropped.resize((1, 1), Image.Resampling.BILINEAR).getpixel((0, 0))
-            avg = avg[:3]
-            self._img_rgb = avg
-            self._compute_glass_color()
-
-            # Soft blurred shadows behind the two glass cards smooth the harsh
-            # cardboard-color transition between the artwork and the curved
-            # shell corners (hiding the frame corner squares).
-            try:
-                from PIL import ImageDraw, ImageFilter
-                e = 8  # how far the shadow extends past each card
-                shadow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-                sd = ImageDraw.Draw(shadow)
-                # sidebar card footprint: x=22, y=22, w=232, h=height-44
-                sd.rounded_rectangle(
-                    [22 - e, 22 - e, 22 + 232 + e, height - 22 + e],
-                    radius=30,
-                    fill=(4, 6, 10, 52),
-                )
-                # content card footprint: x=274, y=22, w=width-296
-                sd.rounded_rectangle(
-                    [274 - e, 22 - e, width - 22 + e, height - 22 + e],
-                    radius=30,
-                    fill=(4, 6, 10, 52),
-                )
-                shadow = shadow.filter(ImageFilter.GaussianBlur(8))
-                glass_final = Image.alpha_composite(glass_final, shadow)
-            except Exception as exc:
-                log("Background shadow render failed:", exc)
-
-            self._glass_mode = True
-            self.bg_photo = ImageTk.PhotoImage(glass_final)
-            self.bg_canvas.delete("bg_img")
-            self.bg_canvas.create_image(0, 0, image=self.bg_photo, anchor="nw", tags="bg_img")
-            self.bg_canvas.tag_lower("bg_img")
-
-            def hex_at(im, x, y):
-                x = max(0, min(im.width - 1, x))
-                y = max(0, min(im.height - 1, y))
-                r, g, b = im.getpixel((x, y))[:3]
-                return "#%02x%02x%02x" % (r, g, b)
-
-            # Sample the backdrop image at each shell card's corner so the
-            # corner squares blend into the artwork (no hard edge).
-            hh = height - 44
-            self._shell_corners = {
-                "sidebar": (
-                    hex_at(glass_final, 22, 22),
-                    hex_at(glass_final, 254, 22),
-                    hex_at(glass_final, 254, hh + 22),
-                    hex_at(glass_final, 22, hh + 22),
-                ),
-                "content": (
-                    hex_at(glass_final, 274, 22),
-                    hex_at(glass_final, width - 22, 22),
-                    hex_at(glass_final, width - 22, hh + 22),
-                    hex_at(glass_final, 274, hh + 22),
-                ),
-            }
-            self._apply_shell_corners()
+            e = 8  # how far the shadow extends past each card
+            shadow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            sd = ImageDraw.Draw(shadow)
+            # sidebar card footprint: x=22, y=22, w=232, h=height-44
+            sd.rounded_rectangle(
+                [22 - e, 22 - e, 22 + 232 + e, height - 22 + e],
+                radius=30,
+                fill=(4, 6, 10, 52),
+            )
+            # content card footprint: x=274, y=22, w=width-296
+            sd.rounded_rectangle(
+                [274 - e, 22 - e, width - 22 + e, height - 22 + e],
+                radius=30,
+                fill=(4, 6, 10, 52),
+            )
+            shadow = shadow.filter(ImageFilter.GaussianBlur(8))
+            glass_final = Image.alpha_composite(glass_final, shadow)
         except Exception as exc:
-            log(f"Background render failed: {exc}")
+            log("Background shadow render failed:", exc)
+
+        return glass_final, avg
+
+    def _apply_background_pil(self, pil_img, avg, width, height, token):
+        """Applies a rendered backdrop on the UI thread (skips stale renders)."""
+        if self.closing or token != self._bg_render_token:
+            return
+        if not hasattr(self, "bg_canvas"):
+            return
+        self._img_rgb = avg
+        self._compute_glass_color()
+        self.bg_photo = ImageTk.PhotoImage(pil_img)
+        self.bg_canvas.delete("bg_img")
+        self.bg_canvas.create_image(0, 0, image=self.bg_photo, anchor="nw", tags="bg_img")
+        self.bg_canvas.tag_lower("bg_img")
+        self._glass_mode = True
+        self._bg_render_size = (width, height)
+
+        def hex_at(im, x, y):
+            x = max(0, min(im.width - 1, x))
+            y = max(0, min(im.height - 1, y))
+            r, g, b = im.getpixel((x, y))[:3]
+            return "#%02x%02x%02x" % (r, g, b)
+
+        # Sample the backdrop image at each shell card's corner so the
+        # corner squares blend into the artwork (no hard edge).
+        hh = height - 44
+        self._shell_corners = {
+            "sidebar": (
+                hex_at(pil_img, 22, 22),
+                hex_at(pil_img, 254, 22),
+                hex_at(pil_img, 254, hh + 22),
+                hex_at(pil_img, 22, hh + 22),
+            ),
+            "content": (
+                hex_at(pil_img, 274, 22),
+                hex_at(pil_img, width - 22, 22),
+                hex_at(pil_img, width - 22, hh + 22),
+                hex_at(pil_img, 274, hh + 22),
+            ),
+        }
+        self._apply_shell_corners()
+        if not self._glass_applied:
+            self._glass_applied = True
+            # Tabs built before the tint existed hold stale captured colors —
+            # rebuild once so every widget re-detects the glass palette.
+            # (The background now renders asynchronously, so this can no longer
+            # rely on the old timed _refresh_appearance call.)
+            self.ui(self._rebuild_ui)
+        else:
+            self._apply_shell_colors()
 
     def _on_window_resize(self, event):
         if event.widget == self:
@@ -3046,9 +3725,9 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
         self._sync_glass_mode()
         self._rebuild_ui()
 
-    def show_about(self):
+    def show_about(self, parent=None):
         panel = ctk.CTkFrame(
-            self.content,
+            parent or self.content,
             fg_color="transparent",
             corner_radius=22,
             border_width=1,
@@ -3311,13 +3990,15 @@ class JanksyLauncher(ctk.CTk, TkinterDnD.DnDWrapper if TkinterDnD else object):
             self.java_path = path
             self.settings["java_path"] = path
             save_json(SETTINGS_FILE, self.settings)
-            if hasattr(self, "java_entry"):
-                self.java_entry.delete(0, "end")
-                self.java_entry.insert(0, path)
+            self._sync_java_entry()
 
     def on_close(self):
         self.closing = True
         self.discord.shutdown()
+        for job_name in ("_bg_resize_job", "_search_job", "_mod_search_job"):
+            if hasattr(self, job_name):
+                try: self.after_cancel(getattr(self, job_name))
+                except Exception: pass
         self.destroy()
 
 

@@ -7,8 +7,10 @@
 ## Features
 
 * **Glassmorphic User Interface:** Clean dark themes and customizable appearance panels.
+* **Auto Java Management:** Detects every Java installation automatically (PATH, JAVA_HOME, Windows registry, vendor folders, official Minecraft launcher runtimes) and **auto-downloads a Temurin JRE 21** when none is found — no manual Java setup required.
 * **Multi-Loader Support:** Manage Vanilla, Fabric, Forge, and Quilt installations effortlessly.
 * **Account Management:** Easily add and switch between player profiles.
+* **Remembers Your Setup:** Re-selects your last played version and defaults the version list to *Installed only* on launch for faster startup.
 * **Advanced Mod Manager:** Built-in `.jar` mod manager with live search and drag-and-drop support.
 * **Multiplayer Server Tracking:** Live ping tracking for online player counts, MOTDs, and custom icons.
 * **Console Logging:** Integrated terminal window that streams real-time game output for troubleshooting.
